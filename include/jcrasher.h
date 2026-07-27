@@ -84,6 +84,12 @@
 #ifndef SEEK_SET
     #define SEEK_SET 0
 #endif
+#ifndef WNOHANG
+    #define WNOHANG 1
+#endif
+#ifndef PR_SET_PDEATHSIG
+    #define PR_SET_PDEATHSIG 1
+#endif
 
 #if defined(__aarch64__) || defined(__arm__)
 
@@ -346,6 +352,19 @@ static pid_t g_nPeekTid;
 static int g_nLastUnwindMethod;
 static int g_nLastMetadataReason;
 
+// Nothing in the crash path may block without a deadline. A dumper that hangs
+// leaves every other thread ptrace-stopped or parked, which turns the process
+// into an unkillable husk that survives the app being relaunched.
+static const unsigned JCRASHER_DUMP_BUDGET_MS  = 8000;  // whole all-threads dump
+static const unsigned JCRASHER_THREAD_PARK_MS  = 200;   // one sibling reaching the handler
+static const unsigned JCRASHER_CHILD_WAIT_MS   = 4000;  // reaping the helper child
+static const unsigned JCRASHER_TRACEE_STOP_MS  = 300;   // one tracee reaching group-stop
+// Longer than the whole budget: a parked thread should normally be released by
+// the dumper, and self-release only as a last resort if the dumper died.
+static const unsigned JCRASHER_PARK_LIMIT_MS   = 12000;
+
+static uint64_t g_nDumpDeadlineMs;
+
 // In-process thread capture (no ptrace, no clone). One thread parked at a time.
 struct SCapSlot { volatile pid_t tid; volatile int state; SRemoteRegs regs; }; // state: 0 idle, 1 requested, 2 parked
 static SCapSlot g_Cap;
@@ -360,6 +379,13 @@ static volatile int g_bFaultGuardActive;
 static pid_t g_nFaultGuardTid;
 
 static const uint32_t JCRASHER_PREINIT_MAGIC = 0x4A435250u; // JCRP
+
+#ifndef JCRASHER_ENABLE_ARM32_INPROCESS_THREADS
+    // Arm32 sibling stack unwinding is fragile on some devices. By default we
+    // capture sibling registers in-process, but only emit PC/LR frames instead
+    // of walking their live stacks. Set this to 1 to restore full sibling unwind.
+    #define JCRASHER_ENABLE_ARM32_INPROCESS_THREADS 0
+#endif
 
 struct SPreinitRequest
 {
@@ -450,6 +476,71 @@ static pid_t SysGetPid()
 { return (pid_t)syscall(SYS_getpid); }
 static pid_t SysGetTid()
 { return (pid_t)syscall(SYS_gettid); }
+static pid_t SysGetPpid()
+{ return (pid_t)syscall(SYS_getppid); }
+static long SysKill(pid_t pid, int sig)
+{ return syscall(SYS_kill, pid, sig); }
+static long SysFutexWaitTimed(volatile int* addr, int val, long nsec)
+{
+    struct timespec ts;
+    ts.tv_sec = nsec / 1000000000L;
+    ts.tv_nsec = nsec % 1000000000L;
+    return syscall(SYS_futex, addr, FUTEX_WAIT, val, &ts, 0, 0);
+}
+
+// Monotonic milliseconds, or 0 if the clock is unavailable. Callers treat 0 as
+// "no deadline" rather than "expired", so a missing clock degrades to the old
+// blocking-ish behaviour instead of cutting every dump short.
+static uint64_t NowMs()
+{
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    if (syscall(SYS_clock_gettime, 1 /*CLOCK_MONOTONIC*/, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void StartDumpDeadline(unsigned ms)
+{
+    uint64_t now = NowMs();
+    g_nDumpDeadlineMs = now ? now + ms : 0;
+}
+
+static bool DumpDeadlineExpired()
+{
+    if (!g_nDumpDeadlineMs) return false;
+    uint64_t now = NowMs();
+    return now != 0 && now >= g_nDumpDeadlineMs;
+}
+
+// Poll for a child instead of blocking on it, then escalate to SIGKILL. Returns
+// 0 if it exited on its own, -1 if it was never ours, -2 if we had to kill it.
+static int ReapChildTimed(pid_t child, unsigned timeout_ms, int* status)
+{
+    if (child <= 0) return -1;
+    int st = 0;
+    for (unsigned waited = 0; waited < timeout_ms; waited += 2) {
+        long r = SysWait4(child, &st, WNOHANG | __WALL);
+        if (r == (long)child) {
+            if (status) *status = st;
+            return 0;
+        }
+        if (r < 0) return -1; // already reaped, or not our child
+        SysNanosleep(2000000); // 2 ms
+    }
+
+    SysKill(child, SIGKILL);
+    for (unsigned waited = 0; waited < 1000; waited += 2) {
+        long r = SysWait4(child, &st, WNOHANG | __WALL);
+        if (r == (long)child) {
+            if (status) *status = st;
+            return -2;
+        }
+        if (r < 0) return -1;
+        SysNanosleep(2000000);
+    }
+    return -2;
+}
 
 static size_t StrLen(const char* s)
 {
@@ -783,15 +874,24 @@ static void CaptureCrash(void* ctx, pid_t tid)
 static void CapHandler(int, siginfo_t*, void* ctx)
 {
     pid_t self = (pid_t)syscall(SYS_gettid);
-    if (g_Cap.tid != self) return;
+    if (__atomic_load_n(&g_Cap.tid, __ATOMIC_ACQUIRE) != self) return;
     if (__atomic_load_n(&g_Cap.state, __ATOMIC_ACQUIRE) != 1) return;
+    // A signal delivered long after its park deadline could otherwise latch onto
+    // the request the dumper has since aimed at a different thread.
+    if (__atomic_load_n(&g_Cap.tid, __ATOMIC_ACQUIRE) != self) return;
 
     FillRegsFromUctx((SRemoteRegs*)&g_Cap.regs, ctx);
     __atomic_store_n(&g_Cap.state, 2, __ATOMIC_RELEASE);
     SysFutex(&g_Cap.state, FUTEX_WAKE, 1);
 
-    while (__atomic_load_n(&g_Cap.state, __ATOMIC_ACQUIRE) == 2)
-        SysFutex(&g_Cap.state, FUTEX_WAIT, 2);
+    // Bounded park. If the dumper dies while holding us here, waiting forever
+    // would leave a thread that cannot be resumed and a process that cannot be
+    // restarted. Self-release once no plausible dump could still be running.
+    const unsigned kSliceMs = 50;
+    for (unsigned waited = 0; waited < JCRASHER_PARK_LIMIT_MS; waited += kSliceMs) {
+        if (__atomic_load_n(&g_Cap.state, __ATOMIC_ACQUIRE) != 2) return;
+        SysFutexWaitTimed(&g_Cap.state, 2, (long)kSliceMs * 1000000L);
+    }
 }
 
 // Install the capture handler. Must run in a normal context (e.g. JNI_OnLoad),
@@ -842,6 +942,24 @@ static void SeedRegs(const SRemoteRegs* r, uintptr_t* pc, uintptr_t* sp, uintptr
     *fp = (uintptr_t)r->uregs[11];      // r11 frame pointer
     *lr = (uintptr_t)r->uregs[14];
     *fp_alt = (uintptr_t)r->uregs[7];   // r7 frame pointer for Thumb builds
+#endif
+}
+
+static uintptr_t RegsPc(const SRemoteRegs* r)
+{
+#if defined(__aarch64__)
+    return (uintptr_t)r->pc;
+#else
+    return (uintptr_t)r->uregs[15];
+#endif
+}
+
+static uintptr_t RegsSp(const SRemoteRegs* r)
+{
+#if defined(__aarch64__)
+    return (uintptr_t)r->sp;
+#else
+    return (uintptr_t)r->uregs[13];
 #endif
 }
 
@@ -1826,15 +1944,23 @@ static size_t MetadataUnwind(pid_t pid, const SRemoteRegs* regs, uintptr_t* fram
     if (cap == 0) return 0;
     SRemoteRegs cur = *regs;
     size_t n = 0;
+    uintptr_t prev_sp = 0;
 
     for (;;) {
-        uintptr_t pc = 0;
-#if defined(__aarch64__)
-        pc = StripPc((uintptr_t)cur.pc);
-#else
-        pc = StripPc((uintptr_t)cur.uregs[15]);
-#endif
-        if (!AppendUniqueFrame(frames, &n, cap, pc)) break;
+        uintptr_t pc = StripPc(RegsPc(&cur));
+        uintptr_t sp = RegsSp(&cur);
+        if (!pc) break;
+        // Frame 0 is the faulting pc and is often *not* executable - that is the
+        // bug being reported. Record it anyway, then let the unwinder recover
+        // through lr/CFI instead of returning an empty stack.
+        if (n != 0 && !IsExecutablePc(pc)) break;
+        // Recursion and tail-call loops produce legitimately repeated pcs, so
+        // dedupe on the (pc, sp) pair: only an unchanged pair means the unwinder
+        // stopped making progress. Dropping on pc alone truncated deep stacks.
+        if (n != 0 && frames[n - 1] == pc && sp == prev_sp) break;
+
+        frames[n++] = pc;
+        prev_sp = sp;
         if (n >= cap) break;
 
         SRemoteRegs next;
@@ -1845,6 +1971,9 @@ static size_t MetadataUnwind(pid_t pid, const SRemoteRegs* regs, uintptr_t* fram
         ok = ExidxUnwindStepArm(pid, &cur, &next);
 #endif
         if (!ok) break;
+        // The stack must unwind towards higher addresses. A step that does not
+        // move sp forward means we are about to spin on the same frame.
+        if (RegsSp(&next) <= sp) break;
         cur = next;
     }
     return n;
@@ -1880,8 +2009,13 @@ static size_t RemoteUnwind(pid_t pid, const SRemoteRegs* regs, uintptr_t* frames
     }
 #endif
 
+    // Prefer the table-based result, but do not discard a materially longer
+    // frame-pointer walk just because CFI happened to manage two frames.
+    bool use_meta = (nm >= nf);
+    if (!use_meta && nm >= 4 && nf <= nm + 2) use_meta = true;
+
     size_t n;
-    if (nm >= 2 || nm >= nf) {
+    if (use_meta) {
         n = nm;
         for (size_t i = 0; i < n; ++i) frames[i] = meta[i];
     } else {
@@ -2918,6 +3052,33 @@ static void DumpThread(int fd, pid_t pid, pid_t tid, bool attached, unsigned fla
     for (size_t i = 0; i < n; ++i) WriteFrameLine(fd, i, frames[i], flags);
 }
 
+static void DumpThreadPcLrOnly(int fd, pid_t pid, pid_t tid, unsigned flags,
+    const SRemoteRegs* regs, size_t max_frames)
+{
+    if (flags & DUMP_THREAD_HEADER) WriteThreadName(fd, pid, tid);
+    if (!regs) {
+        WriteString(fd, "  <registers unavailable>\n");
+        return;
+    }
+
+    if ((flags & DUMP_REGISTERS) && tid != g_nCrashTid) WriteRegs(fd, regs);
+
+    uintptr_t pc = 0, sp = 0, fp = 0, lr = 0, fp_alt = 0;
+    SeedRegs(regs, &pc, &sp, &fp, &lr, &fp_alt);
+
+    uintptr_t frames[2];
+    size_t n = 0;
+    size_t cap = max_frames == 0 ? 2 : max_frames;
+    if (cap > 2) cap = 2;
+
+    AppendUniqueFrame(frames, &n, cap, pc);
+    if (n < cap) AppendUniqueFrame(frames, &n, cap, RewindLr(lr));
+
+    g_nLastUnwindMethod = 5;
+    for (size_t i = 0; i < n; ++i) WriteFrameLine(fd, i, frames[i], flags);
+    if (n == 0) WriteString(fd, "  <no executable pc/lr>\n");
+}
+
 static size_t EnumerateTids(pid_t pid, pid_t* tids, size_t cap)
 {
     char path[64];
@@ -2978,10 +3139,22 @@ static void DumpAllThreadsImpl(int fd, pid_t target, unsigned flags, size_t max_
         // for stack reads when process_vm_readv() is blocked by the ROM.
         if (AttachThread(tids[i])) attached[i] = true;
     }
+    // Wait for group-stop with a deadline. PTRACE_INTERRUPT can be dropped, and
+    // a thread in uninterruptible sleep never stops at all; blocking here left
+    // every other thread ptrace-stopped forever, which is what wedged the app.
     for (size_t i = 0; i < count; ++i) {
-        if (attached[i]) {
+        if (!attached[i]) continue;
+        bool stopped = false;
+        for (unsigned waited = 0; waited < JCRASHER_TRACEE_STOP_MS; waited += 2) {
             int st = 0;
-            SysWait4(tids[i], &st, __WALL);
+            long r = SysWait4(tids[i], &st, __WALL | WNOHANG);
+            if (r == (long)tids[i]) { stopped = true; break; }
+            if (r < 0) break; // thread exited between enumeration and attach
+            SysNanosleep(2000000); // 2 ms
+        }
+        if (!stopped) {
+            SysPtrace(PTRACE_DETACH, tids[i], 0, 0);
+            attached[i] = false;
         }
     }
 
@@ -3000,6 +3173,10 @@ static void DumpAllThreadsImpl(int fd, pid_t target, unsigned flags, size_t max_
 
     for (size_t i = 0; i < count; ++i) {
         if ((skip_crashed || (flags & DUMP_CRASHED_FIRST)) && tids[i] == g_nCrashTid) continue;
+        if (DumpDeadlineExpired()) {
+            WriteString(fd, "<JCrasher: dump budget exceeded; remaining threads skipped>\n");
+            break;
+        }
         DumpThread(fd, target, tids[i], attached[i], flags, max_frames);
     }
 
@@ -3030,6 +3207,10 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
     size_t count = EnumerateTids(pid, tids, 1024);
     if (count == 0) return 0;
 
+#if defined(__arm__) && !JCRASHER_ENABLE_ARM32_INPROCESS_THREADS
+    WriteString(fd, "<JCrasher: arm32 sibling stack unwind skipped; dumping registers and pc/lr>\n");
+#endif
+
     bool skip_crashed = (flags & JCRASHER_DUMP_SKIP_CRASHED) != 0;
     volatile size_t dumped = 0;
 
@@ -3058,7 +3239,14 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
         pid_t tid = tids[i];
         if (tid == self || tid == g_nCrashTid) continue; // crashed thread is handled separately
 
-        g_Cap.tid = tid;
+        // A process with hundreds of threads must not spend the per-thread
+        // deadline on every one of them; stop while the log can still be closed.
+        if (DumpDeadlineExpired()) {
+            WriteString(fd, "<JCrasher: dump budget exceeded; remaining threads skipped>\n");
+            break;
+        }
+
+        __atomic_store_n(&g_Cap.tid, tid, __ATOMIC_RELEASE);
         __atomic_store_n(&g_Cap.state, 1, __ATOMIC_RELEASE);
         if (syscall(SYS_tgkill, pid, tid, g_nCapSig) != 0) {
             __atomic_store_n(&g_Cap.state, 0, __ATOMIC_RELEASE);
@@ -3070,15 +3258,17 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
         // uninterruptible syscall, or with the signal blocked) is skipped after
         // the deadline so the dump always finishes.
         bool parked = false;
-        for (int tries = 0; tries < 1500; ++tries) {
+        for (unsigned waited = 0; waited < JCRASHER_THREAD_PARK_MS * 5; ++waited) {
             if (__atomic_load_n(&g_Cap.state, __ATOMIC_ACQUIRE) == 2) { parked = true; break; }
-            SysNanosleep(200000); // 0.2 ms, ~300 ms total deadline
+            SysNanosleep(200000); // 0.2 ms per try
         }
         if (!parked) {
-            // Release in case it parked right after the deadline; a later, slower
-            // signal delivery sees state != 1 and returns without parking.
+            // Point the slot at nobody and let a late delivery drain, so the
+            // stale signal cannot claim the next thread's request.
+            __atomic_store_n(&g_Cap.tid, (pid_t)-1, __ATOMIC_RELEASE);
             __atomic_store_n(&g_Cap.state, 0, __ATOMIC_RELEASE);
             SysFutex(&g_Cap.state, FUTEX_WAKE, 1);
+            SysNanosleep(2000000); // 2 ms drain
             continue;
         }
 
@@ -3086,7 +3276,14 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
         g_nCapRegsTid = tid;
         g_bFaultGuardActive = 1;
         if (sigsetjmp(g_FaultJmp, 1) == 0) {
+#if defined(__arm__) && !JCRASHER_ENABLE_ARM32_INPROCESS_THREADS
+            SRemoteRegs regs = *(SRemoteRegs*)&g_Cap.regs;
+            __atomic_store_n(&g_Cap.state, 0, __ATOMIC_RELEASE);
+            SysFutex(&g_Cap.state, FUTEX_WAKE, 1);
+            DumpThreadPcLrOnly(fd, pid, tid, flags, &regs, max_frames);
+#else
             DumpThread(fd, pid, tid, false, flags, max_frames);
+#endif
             ++dumped;
         } else {
             WriteString(fd, "<JCrasher: fault while reading thread; skipped>\n");
@@ -3099,6 +3296,12 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
         SysFutex(&g_Cap.state, FUTEX_WAKE, 1);
     }
 
+    // Belt and braces: whatever path we left the loop by, no thread may still be
+    // waiting on this slot.
+    __atomic_store_n(&g_Cap.tid, (pid_t)-1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_Cap.state, 0, __ATOMIC_RELEASE);
+    SysFutex(&g_Cap.state, FUTEX_WAKE, 1024);
+
     SysSigprocmask(SIG_SETMASK, &old_mask, 0);
     sigaction(SIGSEGV, &old_segv, 0);
     sigaction(SIGBUS, &old_bus, 0);
@@ -3108,6 +3311,7 @@ static size_t SnapshotAllThreadsInProcess(int fd, unsigned flags, size_t max_fra
 
 static int ChildMain(int fd, pid_t target, unsigned flags, size_t max_frames)
 {
+    StartDumpDeadline(JCRASHER_DUMP_BUDGET_MS);
     g_nTargetPid = target;
     if (!LoadMapsFor(target)) WriteString(fd, "<failed to read maps>\n");
 
@@ -3227,8 +3431,16 @@ static void PreinitChildMain()
 {
     if (!g_pPreinitShared) syscall(SYS_exit, 1);
 
-    while (g_pPreinitShared->state == 0) {
-        SysFutex(&g_pPreinitShared->state, FUTEX_WAIT, 0);
+    // This is a fork of a live ART process. If it is ever allowed to outlive the
+    // app it keeps the app's fds and mappings alive, and the next launch lands on
+    // a UID that still has a stale process - the "app never starts again" case.
+    SysPrctl(PR_SET_PDEATHSIG, SIGKILL);
+    pid_t parent = SysGetPpid();
+    if (parent <= 1) syscall(SYS_exit, 0); // already reparented: the app is gone
+
+    while (__atomic_load_n(&g_pPreinitShared->state, __ATOMIC_ACQUIRE) == 0) {
+        SysFutexWaitTimed(&g_pPreinitShared->state, 0, 250000000L); // 250 ms
+        if (SysGetPpid() != parent) syscall(SYS_exit, 0);
     }
 
     if (g_pPreinitShared->state != 1) syscall(SYS_exit, 1);
@@ -3375,11 +3587,37 @@ static int DumpWithPreinitDumper(void* crashed_context, unsigned flags, size_t m
     SysFutex(&g_pPreinitShared->state, FUTEX_WAKE, 1);
 
     int st = 0;
-    long wr = SysWait4(g_nPreinitPid, &st, 0);
+    int rc = ReapChildTimed(g_nPreinitPid, JCRASHER_CHILD_WAIT_MS, &st);
     SysPrctl(PR_SET_PTRACER, 0);
-    if (wr != g_nPreinitPid) return DUMP_CHILD_FAILED;
-    if (st != 0 && g_pPreinitShared->result == DUMP_CHILD_FAILED) return DUMP_CHILD_FAILED;
-    return g_pPreinitShared->result;
+
+    // The helper is single-shot: it has exited (or we killed it) either way, so
+    // retire it. Leaving the pid set would make a second crash wait on a pid we
+    // no longer own, and leaving state at 1 would report HELPER_BUSY forever.
+    g_nPreinitPid = 0;
+    int result = g_pPreinitShared->result;
+    g_pPreinitShared->state = 0;
+
+    if (rc == -1) return DUMP_CHILD_FAILED;
+    if (rc == -2) return DUMP_CHILD_FAILED; // hung and was killed; caller falls back
+    if (st != 0 && result == DUMP_CHILD_FAILED) return DUMP_CHILD_FAILED;
+    return result;
+}
+
+// Stop the helper without crashing. Safe to call more than once.
+static void ShutdownPreinitDumper()
+{
+    if (g_nPreinitPid > 0) {
+        // Zero timeout: kill immediately, then poll until it is reaped so we do
+        // not leave a <defunct> entry behind.
+        int st = 0;
+        ReapChildTimed(g_nPreinitPid, 0, &st);
+        g_nPreinitPid = 0;
+    }
+    if (g_nPreinitSockParent >= 0) {
+        SysClose(g_nPreinitSockParent);
+        g_nPreinitSockParent = -1;
+    }
+    g_pPreinitShared = 0;
 }
 
 } // namespace Private
@@ -3405,6 +3643,13 @@ inline int InitAllThreadsDumperPath(const char* path)
 inline bool HasAllThreadsDumper()
 {
     return Private::g_pPreinitShared && Private::g_nPreinitPid > 0;
+}
+
+// Kill the forked helper. Call this on clean shutdown so it can never outlive
+// the app; the in-process snapshot path keeps working without it.
+inline void ShutdownAllThreadsDumper()
+{
+    Private::ShutdownPreinitDumper();
 }
 
 inline bool HasAllThreadsDumperFd(int fd)
@@ -3441,7 +3686,13 @@ inline int DumpFd(int fd, void* crashed_context, unsigned flags, size_t max_fram
 {
     if (fd < 0) return DUMP_BAD_FD;
 
-    if (fallback_to_current && (flags & DUMP_ALL_THREADS) && HasAllThreadsDumperFd(fd)) {
+    // The in-process snapshot needs neither clone nor ptrace, so it must not be
+    // gated on the preinit helper existing. Gating it meant that on any ROM where
+    // the startup clone was blocked we fell straight through to the fork+ptrace
+    // path - exactly the path those ROMs break - and produced no all-threads dump.
+    if (fallback_to_current && (flags & DUMP_ALL_THREADS)) {
+        Private::StartDumpDeadline(Private::JCRASHER_DUMP_BUDGET_MS);
+
         // Dump the crashed thread directly first: local stack reads beat the
         // helper's remote read path on Samsung/HyperOS.
         DumpFd(fd, crashed_context, flags & ~(DUMP_ALL_THREADS | DUMP_CRASHED_FIRST),
@@ -3455,12 +3706,17 @@ inline int DumpFd(int fd, void* crashed_context, unsigned flags, size_t max_fram
         if (got > 0) return DUMP_OK;
 
         // Last resort: the clone+ptrace helper, for ROMs that still allow it.
-        int r = Private::DumpWithPreinitDumper(crashed_context,
-            flags | Private::JCRASHER_DUMP_SKIP_CRASHED, max_frames, fd, 0);
-        if (r == DUMP_OK) return r;
+        if (HasAllThreadsDumper()) {
+            int r = Private::DumpWithPreinitDumper(crashed_context,
+                flags | Private::JCRASHER_DUMP_SKIP_CRASHED, max_frames, fd, 0);
+            if (r == DUMP_OK) return r;
 
-        Private::WriteString(fd, "<JCrasher: helper unavailable; current thread was already dumped>\n");
-        return r;
+            Private::WriteString(fd, "<JCrasher: helper unavailable; current thread was already dumped>\n");
+            return r;
+        }
+
+        Private::WriteString(fd, "<JCrasher: no sibling thread could be sampled; current thread was already dumped>\n");
+        return DUMP_HELPER_NOT_INIT;
     }
 
     Private::CaptureCrash(crashed_context, Private::SysGetTid());
@@ -3537,12 +3793,12 @@ inline int DumpFd(int fd, void* crashed_context, unsigned flags, size_t max_fram
     (void)Private::SysWrite(sync_pipe[1], &c, 1);
     Private::SysClose(sync_pipe[1]);
     int st = 0;
-    Private::SysWait4(child, &st, 0);
+    int rc = Private::ReapChildTimed(child, Private::JCRASHER_CHILD_WAIT_MS, &st);
     Private::SysPrctl(PR_SET_PTRACER, 0);
 
     // If the dumper child was killed by OEM policy/seccomp before writing, do
     // not leave an empty file. Fall back to the current thread only.
-    if (st != 0) {
+    if (rc != 0 || st != 0) {
         Private::WriteString(fd, fallback_to_current ?
             "<JCrasher: dumper child failed; fallback to current thread>\n" :
             "<JCrasher: dumper child failed>\n");
@@ -3563,7 +3819,11 @@ inline int DumpPath(const char* path, void* crashed_context, unsigned flags,
 {
     if (!path || !path[0]) return DUMP_PATH_FAILED;
 
-    if ((flags & DUMP_ALL_THREADS) && HasAllThreadsDumperPath(path)) {
+    // As in DumpFd: the in-process snapshot does not need the preinit helper, so
+    // it must be tried whenever all-threads output was asked for.
+    if (flags & DUMP_ALL_THREADS) {
+        Private::StartDumpDeadline(Private::JCRASHER_DUMP_BUDGET_MS);
+
         int fd = (int)Private::SysOpenAt(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
         if (fd >= 0) {
             DumpFd(fd, crashed_context, flags & ~(DUMP_ALL_THREADS | DUMP_CRASHED_FIRST),
@@ -3576,6 +3836,15 @@ inline int DumpPath(const char* path, void* crashed_context, unsigned flags,
                 max_frames ? max_frames : 64);
             Private::SysClose(fd);
             if (got > 0) return DUMP_OK;
+        }
+
+        if (!HasAllThreadsDumper()) {
+            fd = (int)Private::SysOpenAt(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+            if (fd >= 0) {
+                Private::WriteString(fd, "<JCrasher: no sibling thread could be sampled; current thread was already dumped>\n");
+                Private::SysClose(fd);
+            }
+            return DUMP_HELPER_NOT_INIT;
         }
 
         int r = Private::DumpWithPreinitDumper(crashed_context,
@@ -3685,6 +3954,8 @@ inline int InitAllThreadsDumperPath(const char*)
 { return DUMP_PATH_FAILED; }
 inline bool HasAllThreadsDumper()
 { return false; }
+inline void ShutdownAllThreadsDumper()
+{ }
 inline bool HasAllThreadsDumperFd(int)
 { return false; }
 inline bool HasAllThreadsDumperPath(const char*)
