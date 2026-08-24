@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <limits.h>
+#include <stdarg.h>
+#include <time.h>
 
 #include <aml.h>
 #include <defines.h>
@@ -83,6 +85,40 @@ static Config cfgLocal("ModLoaderCore");
 Config* cfg = &cfgLocal;
 static CFG icfgLocal; ICFG* icfg = &icfgLocal;
 
+// ============================================================================
+// نظام تسجيل الأحداث إلى ملف النص aml_log.txt
+// ============================================================================
+void LogToFile(const char* fmt, ...)
+{
+    if (g_szModsDir[0] == 0) return;
+
+    char logPath[512];
+    snprintf(logPath, sizeof(logPath), "%s/aml_log.txt", g_szModsDir);
+
+    FILE* f = fopen(logPath, "a");
+    if (!f) return;
+
+    time_t rawtime;
+    struct tm* timeinfo;
+    char timeBuffer[32];
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    if (timeinfo)
+    {
+        strftime(timeBuffer, sizeof(timeBuffer), "[%H:%M:%S] ", timeinfo);
+        fputs(timeBuffer, f);
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+
+    fputc('\n', f);
+    fflush(f);
+    fclose(f);
+}
+
 inline size_t __strlen(const char *str)
 {
     const char* s = str;
@@ -127,8 +163,6 @@ inline bool EndsWithSO(const char* base)
     return (blen >= 3) && (!strcmp(base + blen - 3, ".so"));
 }
 
-// Is this actually faster, bruh?
-// P.S. Yeah, it is!
 inline bool CopyFileFaster(const char* file, const char* dest)
 {
     int inFd = open(file, O_RDONLY | O_CLOEXEC);
@@ -153,7 +187,7 @@ inline bool CopyFileFaster(const char* file, const char* dest)
         {
             ++errors;
             if(errors < 5 && (errno == EINTR || errno == EAGAIN) ) continue;
-            break; // Unrecoveable error here.
+            break;
         }
     }
 
@@ -161,7 +195,7 @@ inline bool CopyFileFaster(const char* file, const char* dest)
     close(outFd);
     return (bytesLeft <= 0);
 }
-// Slower version (because it copies the file contents byte-by-byte)
+
 inline bool CopyFile(const char* file, const char* dest)
 {
     FILE* source = fopen(file, "rb");
@@ -237,19 +271,30 @@ void LoadMods(const char* path)
 
     char buf[AML_PATH_MAX], dataBuf[AML_PATH_MAX];
     DIR* dir = opendir(path);
+
+    LogToFile("----------------------------------------");
+    LogToFile("[SCAN START] Checking directory: %s", path);
+
     if (dir != NULL)
     {
         logger->Info("Loading mods from %s", path);
         struct dirent *diread; void* handle;
         const char* gameName = HasFakeAppName() ? g_szFakeAppName : g_szAppName;
+        LogToFile("[INFO] Target Game/Package Name: %s", gameName);
+
+        int filesCount = 0;
+
         while ((diread = readdir(dir)) != NULL)
         {
             if(diread->d_name[0] == '.' &&
-                (diread->d_name[1] == '.' || diread->d_name[1] == 0)) continue; // Skip . and ..
+                (diread->d_name[1] == '.' || diread->d_name[1] == 0)) continue;
+
+            filesCount++;
+            LogToFile("[FILE FOUND] Processing: %s", diread->d_name);
+
             if(!EndsWithSO(diread->d_name))
             {
-                // Useless info for us
-                //logger->Error("File %s is not a mod, atleast it is NOT .SO file!", diread->d_name);
+                LogToFile("[SKIP] %s is not a .so library", diread->d_name);
                 continue;
             }
             int srcLen = snprintf(buf, sizeof(buf), "%s/%s", path, diread->d_name);
@@ -257,26 +302,31 @@ void LoadMods(const char* path)
             if(srcLen < 0 || srcLen >= (int)sizeof(buf) || tmpLen < 0 || tmpLen >= (int)sizeof(dataBuf))
             {
                 logger->Error("Skipping mod %s: path is too long", diread->d_name);
+                LogToFile("[ERROR] Skipping mod %s: path is too long", diread->d_name);
                 continue;
             }
-            //unlink(dataBuf);
-            chmod(dataBuf, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP); // XMDS
-            int removeStatus = remove(dataBuf);
-            //if(removeStatus != 0) logger->Error("Failed to remove temp mod file! This might break the mod loading. Error %d", removeStatus);
+
+            chmod(dataBuf, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP);
+            remove(dataBuf);
+
             if(!CopyFileFaster(buf, dataBuf) && !CopyFile(buf, dataBuf))
             {
                 logger->Error("File %s is failed to be copied! :(", diread->d_name);
+                LogToFile("[ERROR] Failed to copy %s to data directory | Errno: %d (%s)", diread->d_name, errno, strerror(errno));
                 continue;
             }
             chmod(dataBuf, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP);
 
-            handle = dlopen(dataBuf, RTLD_NOW); // Load it to the RAM
+            handle = dlopen(dataBuf, RTLD_NOW);
             if(!handle)
             {
                 logger->Error("Failed to load mod %s: %s", diread->d_name, dlerror());
+                LogToFile("[CRITICAL ERROR] dlopen failed for %s! Cause: %s", diread->d_name, dlerror());
                 remove(dataBuf);
                 continue;
             }
+
+            LogToFile("[SUCCESS] dlopen loaded %s successfully", diread->d_name);
             
             bool keepLoaded = false;
             modInfoFn = (GetModInfoFn)dlsym(handle, "__GetModInfo");
@@ -286,39 +336,52 @@ void LoadMods(const char* path)
                 if(pModInfo == NULL)
                 {
                     logger->Error("Mod %s returned NULL from __GetModInfo!", diread->d_name);
+                    LogToFile("[ERROR] Mod %s returned NULL from __GetModInfo!", diread->d_name);
                 }
                 else
                 {
+                    LogToFile("[MOD INFO] GUID: %s | Name: %s | Version: %s", pModInfo->GUID(), pModInfo->Name(), pModInfo->VersionString());
+
                     maybeINeedAGame = (SpecificGameFn)dlsym(handle, "__INeedASpecificGame");
                     const char* requiredGame = maybeINeedAGame ? maybeINeedAGame() : NULL;
                     if(requiredGame != NULL && requiredGame[0] != 0 && strcmp(requiredGame, gameName) != 0)
                     {
                         logger->Error("Mod (GUID %s) built for the game %s!", pModInfo->GUID(), requiredGame);
+                        LogToFile("[REJECTED] Mod %s requires game: %s (Current: %s)", pModInfo->GUID(), requiredGame, gameName);
                     }
                     else if(!modlist->AddMod(pModInfo, handle, buf))
                     {
                         logger->Error("Mod (GUID %s) is already loaded!", pModInfo->GUID());
+                        LogToFile("[REJECTED] Mod %s is already loaded!", pModInfo->GUID());
                     }
                     else
                     {
                         logger->Info("Mod (GUID %s) has been pre-processed.", pModInfo->GUID());
+                        LogToFile("[LOADED] Mod %s (%s) registered successfully!", diread->d_name, pModInfo->GUID());
                         keepLoaded = true;
                     }
                 }
             }
+            else
+            {
+                LogToFile("[ERROR] %s missing symbol '__GetModInfo'. Not a valid AML mod!", diread->d_name);
+            }
+
             if(!keepLoaded)
             {
                 dlclose(handle);
             }
-            //unlink(dataBuf);
-            removeStatus = remove(dataBuf);
-            if(removeStatus != 0) logger->Error("Failed to remove temp mod file! This might break the mod loading. Error %d", removeStatus);
+
+            int removeStatus = remove(dataBuf);
+            if(removeStatus != 0) logger->Error("Failed to remove temp mod file! Error %d", removeStatus);
         }
         closedir(dir);
+        LogToFile("[SCAN END] Total items scanned in %s: %d", path, filesCount);
     }
     else
     {
         logger->Error("Failed to load mods: unable to open directory");
+        LogToFile("[ERROR] Unable to open directory: %s | Errno: %d (%s)", path, errno, strerror(errno));
     }
 }
 
@@ -361,7 +424,6 @@ JNIEnv* GetCurrentJNI()
     return NULL;
 }
 
-// https://stackoverflow.com/questions/46869901/how-to-get-the-android-context-instance-when-calling-jni-method
 jobject g_GlobalContext = NULL;
 jobject GetCurrentContext()
 {
@@ -494,7 +556,7 @@ template <typename Func> void AML_SplitText(const char* txt, Func action)
 void AML_InitLibs(const char* libsArray)
 {
     g_vLibrariesToBeLoaded.clear();
-    if(!libsArray || !libsArray[0]) return; // Nothing to load.
+    if(!libsArray || !libsArray[0]) return;
     
     AML_SplitText(libsArray, [](std::string_view item)
     {
@@ -521,6 +583,7 @@ void StartAMLRightNow(const char* libsArray = NULL)
     if(g_bAMLStarted)
     {
         logger->Error("Something was trying to boot-up AML again.");
+        LogToFile("[WARNING] AML Boot-up was called multiple times!");
         return;
     }
 
@@ -549,22 +612,6 @@ void StartAMLRightNow(const char* libsArray = NULL)
         return;
     }
 
-    // Preload libs
-    AML_InitLibs(libsArray);
-    
-    /* Must Have for mods */
-    modlist->AddMod(amlmodinfo, 0, "localpath (core)");
-    interfaces->Register("AMLInterface", aml);
-    interfaces->Register("AMLConfig", icfg);
-
-    /* Permissions! We really need them for configs! */
-    /*if(!HasPermissionGranted(g_env, appContext, "READ_EXTERNAL_STORAGE") ||
-       !HasPermissionGranted(g_env, appContext, "WRITE_EXTERNAL_STORAGE"))
-    {
-        // Instead of appContext should be !!!ACTIVITY!!! <- Hard to get without SMALI-Inject (just a smali hand-rewritten, lol)
-        RequestPermissions(g_env, appContext);
-    }*/
-
     /* Internal Storage */
     jobject storageDir = GetStorageDir(g_env);
     jTmp = GetAbsolutePath(g_env, storageDir);
@@ -590,43 +637,69 @@ void StartAMLRightNow(const char* libsArray = NULL)
     logger->Info("Determined app info: %s", g_szAppName);
 
   #ifdef FASTMAN92_CODE
-    /* Fastman92 Part */
     bAML_HasFastmanModified = GetExternalFilesDir_FLA(g_env, appContext, g_szFastman92Android, sizeof(g_szFastman92Android));
     __pathback(g_szFastman92Android);
 
-    // Android/data/... dir
     snprintf(g_szAndroidDataRootDir, sizeof(g_szAndroidDataRootDir), "%s/", g_szFastman92Android);
-    
-    // Android/data/.../mods dir
     snprintf(g_szModsDir, sizeof(g_szModsDir), "%s/mods/", g_szFastman92Android);
     mkdir(g_szModsDir, 0777);
-
-    // Android/data/.../files dir
     snprintf(g_szAndroidDataDir, sizeof(g_szAndroidDataDir), "%s/files/", g_szFastman92Android);
     mkdir(g_szAndroidDataDir, 0777);
-    
-    // Android/data/.../configs dir
     snprintf(g_szCfgPath, sizeof(g_szCfgPath), "%s/configs/", g_szFastman92Android);
     mkdir(g_szCfgPath, 0777);
   #else
-    /* Create a folder in /Android/data/.../ */
     snprintf(g_szAndroidDataRootDir, sizeof(g_szAndroidDataRootDir), "%s/Android/data/%s/", g_szInternalStoragePath, g_szAppName);
     DIR* dir = opendir(g_szAndroidDataRootDir);
     if(dir != NULL) closedir(dir);
     else GetExternalFilesDir(g_env, appContext);
 
-    /* Create "mods" folder in /Android/data/.../ */
     snprintf(g_szModsDir, sizeof(g_szModsDir), "%s/Android/data/%s/mods/", g_szInternalStoragePath, g_szAppName);
     mkdir(g_szModsDir, 0777);
 
-    /* Create "files" folder in /Android/data/.../ */
     snprintf(g_szAndroidDataDir, sizeof(g_szAndroidDataDir), "%s/Android/data/%s/files/", g_szInternalStoragePath, g_szAppName);
-    mkdir(g_szAndroidDataDir, 0777); // Who knows, right?
+    mkdir(g_szAndroidDataDir, 0777);
 
-    /* Create "configs" folder in /Android/data/.../ */
     snprintf(g_szCfgPath, sizeof(g_szCfgPath), "%s/Android/data/%s/configs/", g_szInternalStoragePath, g_szAppName);
     mkdir(g_szCfgPath, 0777);
   #endif
+
+    // ========================================================================
+    // تهيئة ملف aml_log.txt ومسح السجل القديم
+    // ========================================================================
+    char mainLogPath[512];
+    snprintf(mainLogPath, sizeof(mainLogPath), "%s/aml_log.txt", g_szModsDir);
+    FILE* fInit = fopen(mainLogPath, "w");
+    if(fInit)
+    {
+        fputs("=== AML Log System Started ===\n", fInit);
+        fclose(fInit);
+    }
+
+    LogToFile("[AML INIT] Storage Path: %s", g_szInternalStoragePath);
+    LogToFile("[AML INIT] Package Name: %s", g_szAppName);
+    LogToFile("[AML INIT] Mods Folder: %s", g_szModsDir);
+
+    // ========================================================================
+    // التحقق المباشر من وجود مكتبة GTA SA في الذاكرة
+    // ========================================================================
+    void* hGTASA = dlopen("libgtasa.so", RTLD_NOLOAD);
+    if (hGTASA)
+    {
+        LogToFile("[GAME CHECK] Found 'libgtasa.so' loaded in RAM at: %p", hGTASA);
+        dlclose(hGTASA);
+    }
+    else
+    {
+        LogToFile("[GAME CHECK] 'libgtasa.so' is NOT loaded in memory yet (Normal if AML starts early).");
+    }
+
+    // Preload libs
+    AML_InitLibs(libsArray);
+    
+    /* Must Have for mods */
+    modlist->AddMod(amlmodinfo, 0, "localpath (core)");
+    interfaces->Register("AMLInterface", aml);
+    interfaces->Register("AMLConfig", icfg);
 
     /* root/data/data Folder */
     jobject filesDir = GetFilesDir(g_env, appContext);
@@ -634,6 +707,7 @@ void StartAMLRightNow(const char* libsArray = NULL)
     if(!CopyJStringUTF(g_env, filesPath, g_szDataDirPath, sizeof(g_szDataDirPath)))
     {
         logger->Error("Failed to determine app data path.");
+        LogToFile("[ERROR] Failed to determine app data path!");
         if(filesPath) g_env->DeleteLocalRef(filesPath);
         if(filesDir) g_env->DeleteLocalRef(filesDir);
         return;
@@ -643,7 +717,8 @@ void StartAMLRightNow(const char* libsArray = NULL)
 
     /* AML Config */
     logger->Info("Reading core config...");
-    cfg->Init(); // That's why we dont have it in config.cpp
+    LogToFile("[CONFIG] Reading ModLoaderCore config...");
+    cfg->Init();
     cfg->Bind("Author", "")->SetString("RusJJ aka [-=KILL MAN=-]"); cfg->ClearLast();
     cfg->Bind("Discord", "")->SetString("https://discord.gg/2MY7W39kBg"); cfg->ClearLast();
     bool bHasChangedCfgAuthor = cfg->IsValueChanged();
@@ -663,7 +738,6 @@ void StartAMLRightNow(const char* libsArray = NULL)
 
     g_bCrashAML = cfg->GetBool("CrashAML", false, "DevTools");
     g_bNoMods = cfg->GetBool("DontLoadMods", false, "DevTools");
-    //g_bSimplerCrashLog = cfg->GetBool("SimplerCrashLogs", g_bSimplerCrashLog, "DevTools");
     g_bNoSPInLog = cfg->GetBool("NoStackInCrashLog", false, "DevTools");
     g_bNoModsInLog = cfg->GetBool("NoModsInCrashLog", false, "DevTools");
     g_bMLSOnlyManualSaves = cfg->GetBool("MLSOnlyManualSaves", false, "DevTools");
@@ -674,7 +748,7 @@ void StartAMLRightNow(const char* libsArray = NULL)
     cfg->Save();
 
     /* Android version */
-    char sdk_ver_str[92]; // PROPERTY_VALUE_MAX
+    char sdk_ver_str[92];
     if(__system_property_get("ro.build.version.sdk", sdk_ver_str))
     {
         g_nAndroidSDKVersion = atoi(sdk_ver_str);
@@ -693,6 +767,7 @@ void StartAMLRightNow(const char* libsArray = NULL)
             g_env->DeleteLocalRef(versionClass);
         }
     }
+    LogToFile("[SYSTEM] Android SDK Version detected: %d", g_nAndroidSDKVersion);
 
     /* Catch the fish! */
     if(cfg->GetBool("SignalHandler", true))
@@ -712,10 +787,14 @@ void StartAMLRightNow(const char* libsArray = NULL)
 
     /* Mods? */
     logger->Info("Working with mods...");
+    LogToFile("[MODS ENGINE] Starting mod scan process...");
+
     #ifdef __IL2CPPUTILS
         logger->Info("IL2CPP: Attempting to initialize IL2CPP-Utils");
+        LogToFile("[IL2CPP] Initializing IL2CPP Hooks...");
         IL2CPP::Func::HookFunctions();
     #endif
+
     if(!g_bNoMods)
     {
         MLS::LoadFile();
@@ -729,12 +808,17 @@ void StartAMLRightNow(const char* libsArray = NULL)
             LoadMods(g_szModsDir);
         }
     }
+    else
+    {
+        LogToFile("[WARNING] Loading mods disabled by DevTools config (DontLoadMods=true)");
+    }
 
-    /* All mods are loaded now. We should check for dependencies! */
+    /* Dependencies Check */
     logger->Info("Checking for dependencies...");
+    LogToFile("[MODS ENGINE] Checking mod dependencies...");
     modlist->ProcessDependencies();
     
-    /* Process features */
+    /* Features */
     #ifdef __XDL
         g_pAML->AddFeature("XDL");
     #endif
@@ -742,10 +826,10 @@ void StartAMLRightNow(const char* libsArray = NULL)
         g_pAML->AddFeature("IL2CPP");
     #endif
     if(g_pAML->IsGameFaked()) g_pAML->AddFeature("FAKEGAME");
-    if(bHasChangedCfgAuthor) g_pAML->AddFeature("STEALER"); // For fun
+    if(bHasChangedCfgAuthor) g_pAML->AddFeature("STEALER");
     if(!logger->HasOutput()) g_pAML->AddFeature("NOLOGGING");
     
-    /* Load news first! */
+    /* Load news */
     if(g_nEnableNews > 0)
     {
         char newsBuf[24]{0};
@@ -759,7 +843,7 @@ void StartAMLRightNow(const char* libsArray = NULL)
                     aml->ShowToast(true, "%s", g_szNewsString);
                 }
 
-                newsBuf[16] = '|'; // Anti- news spamming :p
+                newsBuf[16] = '|';
                 newsBuf[17] = 0;
                 g_pLastNewsId->SetString(newsBuf);
                 cfg->Save();
@@ -768,19 +852,24 @@ void StartAMLRightNow(const char* libsArray = NULL)
         }
     }
     
-    /* All mods are sorted and should be loaded! */
+    /* Execution Stages */
     if(bEnableUpdater)
     {
         g_pAML->AddFeature("UPDATER");
         modlist->ProcessUpdater();
         logger->Info("Mods were updated!");
+        LogToFile("[UPDATER] Mods updater processed.");
     }
     if(!g_bNoMods)
     {
+        LogToFile("[LAUNCH] Executing ProcessPreLoading()...");
         modlist->ProcessPreLoading();
+        LogToFile("[LAUNCH] Executing ProcessLoading()...");
         modlist->ProcessLoading();
+        LogToFile("[LAUNCH] Executing OnAllModsLoaded()...");
         modlist->OnAllModsLoaded();
         logger->Info("Mods were launched!");
+        LogToFile("[SUCCESS] All mods successfully loaded and launched!");
     }
     pLastModProcessed = NULL;
 
@@ -790,20 +879,14 @@ void StartAMLRightNow(const char* libsArray = NULL)
         snprintf(g_szUserAgent, sizeof(g_szUserAgent), "AndroidModLoader/%s (Android; ARM; ARM64)", amlmodinfo->VersionString());
     #endif
 
-    /* Fake crash for crash handler testing (does not work?) */
-    //if(g_bCrashAML) __builtin_trap(); // Dont let really weird guys to use this...
-
-    // Final initialisation (mods can now modify JNI_OnLoad! )
     AML_PostLoadLibs();
 
     g_bAMLStarted = true;
+    LogToFile("=== AML Engine Fully Started ===");
 }
-
-
 
 extern "C" JNIEXPORT void JNICALL Java_net_rusjj_amlcore_launchAMLCore(JNIEnv *env, jclass clazz, jstring libsArray)
 {
-    // Early stage. Launches required libraries, JNI_OnLoad is delayed.
     const char* szLibsArray = (libsArray ? env->GetStringUTFChars(libsArray, NULL) : NULL);
 
     StartAMLRightNow(szLibsArray);
@@ -845,24 +928,18 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
     g_pJavaVM = vm;
     g_pJavaReserved = reserved;
 
-    // Some important stuff to do first
     g_MainThreadID = gettid();
     InitJavaUIThreadLooper();
     
-    /* For the delayed start-up (later) */
-    StartAMLRightNow(); // Temporarily do it just like before!
+    StartAMLRightNow();
     
-    /* Return the value it needs */
     return JNI_VERSION_1_6;
 }
 
 void ClearIniPointers();
 JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
 {
-    // Not sure if it'll work...
-    // It worked once in my tests, lol
-    // UPD: It is NOT safe. Android moment.
-
+    LogToFile("[AML] Engine Unloading...");
     modlist->ProcessUnloading();
     ClearIniPointers();
 }
