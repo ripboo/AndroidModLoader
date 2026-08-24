@@ -1,4 +1,4 @@
-Name: AML Mod Compiler
+name: AML Mod Compiler
 
 on:
   push:
